@@ -1,0 +1,121 @@
+{
+  "mappings": {
+    "dynamic_templates": [
+      {
+        "dates_d": {
+          "match": "*_d",
+          "mapping": {
+            "type": "date"
+          }
+        }
+      },
+      {
+        "dates_da": {
+          "match": "*_da",
+          "mapping": {
+            "type": "date"
+          }
+        }
+      },
+      {
+        "dates_dr": {
+          "match": "*_dr",
+          "mapping": {
+            "type": "date",
+            "store": true
+          }
+        }
+      },
+      {
+        "dates_ds": {
+          "match": "*_ds",
+          "mapping": {
+            "type": "date"
+          }
+        }
+      },
+      {
+        "ints_i": {
+          "match": "*_i",
+          "mapping": {
+            "type": "integer"
+          }
+        }
+      },
+      {
+        "ints_ia": {
+          "match": "*_ia",
+          "mapping": {
+            "type": "integer"
+          }
+        }
+      },
+      {
+        "ints_is": {
+          "match": "*_is",
+          "mapping": {
+            "type": "integer"
+          }
+        }
+      },
+      {
+        "literals_l": {
+          "match": "*_l",
+          "mapping": {
+            "type": "keyword"
+          }
+        }
+      },
+      {
+        "literals_la": {
+          "match": "*_la",
+          "mapping": {
+            "type": "keyword"
+          }
+        }
+      },
+      {
+        "literals_ls": {
+          "match": "*_ls",
+          "mapping": {
+            "type": "keyword"
+          }
+        }
+      },
+      {
+        "texts_t": {
+          "match": "*_t",
+          "mapping": {
+            "type": "text"
+          }
+        }
+      },
+      {
+        "texts_ta": {
+          "match": "*_ta",
+          "mapping": {
+            "type": "text"
+          }
+        }
+      },
+      {
+        "texts_tr": {
+          "match": "*_tr",
+          "mapping": {
+            "type": "text",
+            "store": true
+          }
+        }
+      },
+      {
+        "texts_ts": {
+          "match": "*_ts",
+          "mapping": {
+            "type": "text",
+            "fielddata": true
+          }
+        }
+      }
+    ]
+  }
+}

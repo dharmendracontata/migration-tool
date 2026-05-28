@@ -1,0 +1,75 @@
+# ─── Credentials & Environment ────────────────────────────────────────────────
+# Real credentials — NEVER commit these
+.env
+.env.local
+.env.*.local
+
+# ─── Node.js ──────────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# ─── Runtime Artifacts ────────────────────────────────────────────────────────
+*.pid
+*.pid.lock
+migration.pid
+
+# Progress & state snapshots written at runtime
+migration-progress.json
+migration-progress.json.tmp
+migration-dlq.ndjson
+progress.json
+failed-ids.json
+checkpoint.json
+
+# ─── Logs ─────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ─── Scratch & One-off Scripts ────────────────────────────────────────────────
+scratch/
+
+# Test / debug helpers that are not part of the production tool
+test_*.js
+benchmark.js
+replay-failed.js
+syncLogsToMysql.js
+setup_and_run.bat
+setup_and_run.sh
+
+# ─── Data Files ───────────────────────────────────────────────────────────────
+*.txt
+*.sql
+*.csv
+*.json.bak
+
+# ─── OS & Editor Metadata ─────────────────────────────────────────────────────
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# JetBrains IDEs
+.idea/
+*.iml
+
+# Vim / Emacs swap files
+*.swp
+*.swo
+[._]*.s[a-v][a-z]
+[._]*.s[w][a-z]
