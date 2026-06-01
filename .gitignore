@@ -36,8 +36,6 @@ test_*.js
 benchmark.js
 replay-failed.js
 syncLogsToMysql.js
-setup_and_run.bat
-setup_and_run.sh
 
 # ─── Data Files ───────────────────────────────────────────────────────────────
 *.txt
