@@ -42,7 +42,7 @@ async function _drain() {
       const chunk = buffer.splice(0, LOG_BATCH_SIZE);
       try {
         await saveMigrationLogs(chunk);
-        mainLogger.debug(`LogBuffer: flushed ${chunk.length} entries to migration_logs.`);
+        mainLogger.debug(`LogBuffer: flushed ${chunk.length} entries to migration_prod_logs.`);
       } catch (err) {
         // Put failed entries back at front so they're retried on next drain cycle.
         buffer.unshift(...chunk);

@@ -57,7 +57,7 @@ function checkEnv() {
     if (!process.env[key]) missing.push(key);
   }
 
-  // Log DB required in prod (migration_logs written to local Docker MySQL)
+  // Log DB required in prod (migration_prod_logs written to MySQL Log DB)
   if (isProd) {
     for (const key of REQUIRED_LOG_VARS) {
       if (!process.env[key]) missing.push(key);

@@ -9,7 +9,7 @@ const { mainLogger } = require("../utils/logger");
 
 
 const httpsAgent = new https.Agent({
-  rejectUnauthorized: false, // handles both local Docker self-signed cert and AWS OpenSearch
+  rejectUnauthorized: false, // handles both self-signed certs and AWS OpenSearch
   family: 4,
 });
 

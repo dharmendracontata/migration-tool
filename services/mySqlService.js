@@ -22,7 +22,7 @@ const PARALLEL_WORKERS = parseInt(process.env.PARALLEL_WORKERS) || 5;
 // ─── CONNECTION POOLS ────────────────────────────────────────────────────────
 
 let sourcePool;  // Staging RDS — reads only
-let logPool;     // Local Docker MySQL — migration_logs writes only
+let logPool;     // MySQL Log DB — migration_prod_logs writes only
 
 function getPool() {
   if (!sourcePool) {
@@ -51,12 +51,13 @@ function getLogPool() {
     const logHost = process.env.MYSQL_LOG_HOST;
 
     // Hard-fail if log DB is not configured — we must NOT fall back to the
-    // read-only source RDS or silently lose migration_logs.
+    // Hard-fail if log DB is not configured — we must NOT fall back to the
+    // read-only source RDS or silently lose migration_prod_logs.
     if (!logHost) {
       throw new Error(
         'MYSQL_LOG_HOST is not set. ' +
-        'Set MYSQL_LOG_* variables in .env to point at your local Docker MySQL ' +
-        'where migration_logs should be written. ' +
+        'Set MYSQL_LOG_* variables in .env to point at your MySQL Log DB ' +
+        'where migration_prod_logs should be written. ' +
         'Do NOT reuse the source RDS credentials here.'
       );
     }
@@ -73,7 +74,7 @@ function getLogPool() {
       idleTimeout:        60000,
       connectTimeout:     15000,
     });
-    mainLogger.info(`MySQL log pool (local Docker) → ${logHost}:${process.env.MYSQL_LOG_PORT || 3306}`);
+    mainLogger.info(`MySQL log pool → ${logHost}:${process.env.MYSQL_LOG_PORT || 3306}`);
   }
   return logPool;
 }
@@ -369,22 +370,22 @@ async function fetchBatch(cursor) {
   return { docs, cursor: rows[rows.length - 1].matter_ucid };
 }
 
-// ─── MIGRATION LOG TABLE (local Docker MySQL) ──────────────────────────────────
+// ─── MIGRATION LOG TABLE (MySQL Log DB) ──────────────────────────────────
 
 async function initializeMigrationTable() {
   const pool = getLogPool();
   try {
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS migration_logs (
+      CREATE TABLE IF NOT EXISTS migration_prod_logs (
         ucid      VARCHAR(255) PRIMARY KEY,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         status    VARCHAR(20),
         whyfailed TEXT
       )
     `);
-    mainLogger.info('MySQL migration_logs table initialized (local Docker DB).');
+    mainLogger.info('MySQL migration_prod_logs table initialized.');
   } catch (err) {
-    mainLogger.error(`Error initializing migration_logs table: ${err.message}`);
+    mainLogger.error(`Error initializing migration_prod_logs table: ${err.message}`);
     throw err;
   }
 }
@@ -395,7 +396,7 @@ async function saveMigrationLogs(logs) {
   const values = logs.map(log => [log.ucid, log.status, log.whyfailed || null]);
   try {
     await pool.query(
-      `INSERT INTO migration_logs (ucid, status, whyfailed) VALUES ?
+      `INSERT INTO migration_prod_logs (ucid, status, whyfailed) VALUES ?
        ON DUPLICATE KEY UPDATE status=VALUES(status), whyfailed=VALUES(whyfailed), timestamp=CURRENT_TIMESTAMP`,
       [values]
     );
