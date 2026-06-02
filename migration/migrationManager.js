@@ -10,7 +10,8 @@ const dlq = require("../utils/deadLetterQueue");
 const retry = require("../utils/retry");
 const { captureException, captureMessage, addBreadcrumb } = require("../utils/sentry");
 
-const PARALLEL_WORKERS = parseInt(process.env.PARALLEL_WORKERS) || 5;
+const PARALLEL_WORKERS  = parseInt(process.env.PARALLEL_WORKERS) || 5;
+const RANGE_SAVE_INTERVAL = parseInt(process.env.RANGE_SAVE_INTERVAL) || 200; // flush every N ranges
 const limit = pLimit(PARALLEL_WORKERS);
 
 async function startMigration() {
@@ -22,103 +23,165 @@ async function startMigration() {
   await retry(() => initializeIndex());
 
   // ── Load saved state ───────────────────────────────────────────────────────
-  const saved        = loadProgress();
-  const completedSet = new Set(saved.completedRanges || []);
-  let totalSaved     = saved.totalSaved  || 0;
-  let totalFailed    = saved.totalFailed || 0;
+  const saved            = loadProgress();
+  const completedSet     = new Set(saved.completedRanges || []);
+  let   totalSaved       = saved.totalSaved       || 0;
+  let   totalFailed      = saved.totalFailed      || 0;
+  let   allRanges        = saved.rangeBoundaries  || [];   // grows as streaming progresses
+  const streamingComplete = saved.streamingComplete === true;
 
-  // ── Compute OR restore range boundaries ───────────────────────────────────
-  let ranges = saved.rangeBoundaries;
-  if (!ranges || ranges.length === 0) {
-    mainLogger.info('Computing cursor ranges from MySQL (one-time, will be cached)...');
-    ranges = await computeCursorRanges(parseInt(process.env.BATCH_SIZE) || 2000);
-    // Cache immediately so a crash after compute doesn't force a re-compute
+  // ── Helper: persist current state ─────────────────────────────────────────
+  // Called from both the streaming callback and worker completions.
+  // Node.js is single-threaded so there are no real races; we write atomically.
+  function persist(opts = {}) {
     saveProgress({
-      completedRanges: [],
-      totalRanges:     ranges.length,
-      totalSaved:      0,
-      totalFailed:     0,
-      rangeBoundaries: ranges,
+      completedRanges:   Array.from(completedSet),
+      totalRanges:       allRanges.length,
+      totalSaved,
+      totalFailed,
+      streamingComplete: opts.streamingComplete ?? streamingComplete,
+      rangeBoundaries:   allRanges,
     });
-    mainLogger.info(`Cached ${ranges.length} range boundaries in progress file.`);
-  } else {
-    mainLogger.info(`Restored ${ranges.length} ranges from progress file. ${completedSet.size} already completed.`);
   }
 
-  const pendingRanges = ranges.filter(r => !completedSet.has(r.index));
-  mainLogger.info(
-    `Starting parallel migration: ${pendingRanges.length} ranges pending | ` +
-    `${completedSet.size} done | ${PARALLEL_WORKERS} parallel workers`
-  );
+  // ── Helper: dispatch one range to a p-limited worker ──────────────────────
+  const workerPromises = [];
 
-  // ── Dispatch all ranges concurrently with p-limit ─────────────────────────
-  //
-  // Each worker independently:
-  //   1. Fetches its own bounded slice from MySQL (no coordination needed)
-  //   2. Bulk-indexes into OpenSearch
-  //   3. Atomically marks itself done in the progress file
-  //
-  // On crash: restart from where you left off — completed ranges are skipped.
-  // No data loss: ranges use inclusive toUcid bounds so nothing is missed.
-  // No duplicates: upsert (_id) makes re-running safe.
+  function dispatchRange(range) {
+    const p = limit(async () => {
+      const rangeLabel = `Range #${range.index} [${range.fromUcid} → ${range.toUcid}]`;
+      try {
+        mainLogger.info(`${rangeLabel}: fetching...`);
+        const docs = await retry(() => fetchRange(range.fromUcid, range.toUcid));
 
-  await Promise.all(
-    pendingRanges.map(range =>
-      limit(async () => {
-        const rangeLabel = `Range #${range.index} [${range.fromUcid} → ${range.toUcid}]`;
-        try {
-          mainLogger.info(`${rangeLabel}: fetching...`);
-          const docs = await retry(() => fetchRange(range.fromUcid, range.toUcid));
+        if (!docs || docs.length === 0) {
+          mainLogger.warn(`${rangeLabel}: 0 docs found — marking complete.`);
+        } else {
+          const { succeeded, failed } = await processBatch(docs, range.index);
+          totalSaved  += succeeded;
+          totalFailed += failed;
+          const logMsg =
+            `${rangeLabel}: ✅ ${succeeded}/${docs.length} saved` +
+            (failed > 0 ? ` | ⚠️  ${failed} → DLQ` : "") +
+            ` | Done: ${completedSet.size + 1}/${allRanges.length}`;
+          mainLogger.info(logMsg);
+          addBreadcrumb("migration", logMsg, "info", { rangeIndex: range.index, succeeded, failed });
+        }
 
-          if (!docs || docs.length === 0) {
-            mainLogger.warn(`${rangeLabel}: 0 docs found — marking complete.`);
+        completedSet.add(range.index);
+        persist();
+
+      } catch (err) {
+        mainLogger.error(`${rangeLabel} FAILED — will retry on restart. Error: ${err.message}`);
+        captureException(err, {
+          tags:  { process: "migrationManager.js", phase: "range-processing", rangeIndex: range.index },
+          extra: { rangeLabel, range },
+        });
+      }
+    });
+    workerPromises.push(p);
+  }
+
+  // ── Phase 1: Streaming (with incremental save + immediate dispatch) ────────
+  if (streamingComplete) {
+    // ── Fast path: streaming already finished in a prior run ────────────────
+    mainLogger.info(
+      `Streaming already complete. ` +
+      `${allRanges.length} ranges restored, ${completedSet.size} already done.`
+    );
+    const pending = allRanges.filter(r => !completedSet.has(r.index));
+    mainLogger.info(
+      `Starting parallel migration: ${pending.length} pending | ` +
+      `${completedSet.size} done | ${PARALLEL_WORKERS} workers`
+    );
+    pending.forEach(dispatchRange);
+
+  } else {
+    // ── Resumable streaming path ──────────────────────────────────────────
+    const resumeFromUcid = allRanges.length > 0
+      ? allRanges[allRanges.length - 1].toUcid
+      : null;
+    const startIndex = allRanges.length;
+
+    if (resumeFromUcid) {
+      mainLogger.info(
+        `Resuming range pre-computation from UCID: ${resumeFromUcid} ` +
+        `(${allRanges.length} ranges already cached, ${completedSet.size} migrated)`
+      );
+    } else {
+      mainLogger.info("Starting fresh range pre-computation (streaming all UCIDs)...");
+    }
+
+    // Dispatch any already-cached ranges that haven't been migrated yet
+    // so migration runs in parallel with the stream from the very first second.
+    const alreadyCached = allRanges.filter(r => !completedSet.has(r.index));
+    if (alreadyCached.length > 0) {
+      mainLogger.info(`Dispatching ${alreadyCached.length} cached-but-pending ranges immediately...`);
+      alreadyCached.forEach(dispatchRange);
+    }
+
+    // Track whether onRangesReady has marked streaming complete
+    let _streamingComplete = false;
+
+    // Stream and receive new ranges in chunks
+    await computeCursorRanges(
+      parseInt(process.env.BATCH_SIZE) || 2000,
+      {
+        resumeFromUcid,
+        startIndex,
+        saveInterval: RANGE_SAVE_INTERVAL,
+
+        onRangesReady(newRanges, isLast) {
+          // Append to the in-memory list and persist immediately
+          allRanges.push(...newRanges);
+
+          if (isLast) {
+            _streamingComplete = true;
+            mainLogger.info(
+              `✅ Streaming complete — total ranges: ${allRanges.length} ` +
+              `(${completedSet.size} already migrated)`
+            );
           } else {
-            const { succeeded, failed } = await processBatch(docs, range.index);
-            totalSaved  += succeeded;
-            totalFailed += failed;
-            const logMsg = `${rangeLabel}: ✅ ${succeeded}/${docs.length} saved` +
-                           (failed > 0 ? ` | ⚠️  ${failed} → DLQ` : '') +
-                           ` | Progress: ${completedSet.size + 1}/${ranges.length}`;
-            mainLogger.info(logMsg);
-
-            // Record Sentry breadcrumb for local context
-            addBreadcrumb("migration", logMsg, "info", { rangeIndex: range.index, succeeded, failed });
+            mainLogger.info(
+              `Cached ${allRanges.length} ranges so far (${completedSet.size} migrated)...`
+            );
           }
 
-          // Mark range complete and persist atomically
-          completedSet.add(range.index);
+          // Persist to disk (streamingComplete flag written on final flush)
           saveProgress({
-            completedRanges: Array.from(completedSet),
-            totalRanges:     ranges.length,
+            completedRanges:   Array.from(completedSet),
+            totalRanges:       allRanges.length,
             totalSaved,
             totalFailed,
-            rangeBoundaries: ranges,
+            streamingComplete: _streamingComplete,
+            rangeBoundaries:   allRanges,
           });
 
-        } catch (err) {
-          // Range stays NOT in completedSet → will be retried on next run
-          mainLogger.error(`${rangeLabel} FAILED — will retry on restart. Error: ${err.message}`);
-          captureException(err, {
-            tags: { process: "migrationManager.js", phase: "range-processing", rangeIndex: range.index },
-            extra: { rangeLabel, range }
-          });
-        }
-      })
-    )
-  );
+          // Dispatch new ranges to workers immediately — no waiting!
+          newRanges
+            .filter(r => !completedSet.has(r.index))
+            .forEach(dispatchRange);
+        },
+      }
+    );
+  }
+
+  // ── Phase 2: Wait for all dispatched workers to finish ────────────────────
+  mainLogger.info(`Waiting for ${workerPromises.length} workers to complete...`);
+  await Promise.all(workerPromises);
 
   // ── Final flush & summary ──────────────────────────────────────────────────
   if (process.env.NODE_ENV === "prod") {
     await logBuffer.flush();
   }
 
-  const failedRanges = ranges.filter(r => !completedSet.has(r.index));
+  const failedRanges = allRanges.filter(r => !completedSet.has(r.index));
   const dlqCount     = dlq.count();
 
-  mainLogger.info('════════════════════════════════════════');
-  mainLogger.info('  MIGRATION COMPLETE');
-  mainLogger.info('════════════════════════════════════════');
-  mainLogger.info(`  Ranges completed : ${completedSet.size} / ${ranges.length}`);
+  mainLogger.info("════════════════════════════════════════");
+  mainLogger.info("  MIGRATION COMPLETE");
+  mainLogger.info("════════════════════════════════════════");
+  mainLogger.info(`  Ranges completed : ${completedSet.size} / ${allRanges.length}`);
   mainLogger.info(`  Docs saved       : ${totalSaved.toLocaleString()}`);
   mainLogger.info(`  Docs failed      : ${totalFailed.toLocaleString()}`);
   mainLogger.info(`  DLQ entries      : ${dlqCount}`);
@@ -126,13 +189,13 @@ async function startMigration() {
   if (failedRanges.length > 0) {
     mainLogger.warn(`  ⚠️  ${failedRanges.length} ranges incomplete — run again to retry.`);
     captureMessage(`Migration completed with ${failedRanges.length} incomplete ranges`, "warning", {
-      extra: { completedSetCount: completedSet.size, totalRangesCount: ranges.length, totalSaved, totalFailed, dlqCount }
+      extra: { completedSetCount: completedSet.size, totalRangesCount: allRanges.length, totalSaved, totalFailed, dlqCount },
     });
   }
   if (dlqCount > 0) {
     mainLogger.warn(`  ⚠️  ${dlqCount} docs in DLQ — run: node replay-failed.js`);
   }
-  mainLogger.info('════════════════════════════════════════');
+  mainLogger.info("════════════════════════════════════════");
 }
 
 module.exports = startMigration;

@@ -237,29 +237,58 @@ async function hydrateMatterRows(rows) {
 // ─── RANGE PRE-COMPUTATION ───────────────────────────────────────────────────
 
 /**
- * Fetches only the matter_ucid column (no joins) and splits into range objects.
- * One-time call at migration start; result is cached in progress file.
+ * Streams matter_ucid to build range boundary objects incrementally.
+ *
+ * Supports resuming from a previous crash:
+ *   - resumeFromUcid: skip rows already processed (WHERE matter_ucid > ?)
+ *   - startIndex:     offset range indices so they don't clash with cached ones
+ *
+ * Calls onRangesReady(newRanges, isLast) every saveInterval completed ranges
+ * (and once more with the final tail batch when the stream ends).  The caller
+ * can use this to persist ranges and dispatch migration workers immediately —
+ * without waiting for all 333 M rows to be scanned first.
  *
  * @param {number} batchSize
- * @returns {{ index, fromUcid, toUcid }[]}
+ * @param {object} opts
+ * @param {string|null}   opts.resumeFromUcid  - Resume stream after this UCID
+ * @param {number}        opts.startIndex       - Index offset for new ranges
+ * @param {number}        opts.saveInterval     - Flush every N ranges (default 200)
+ * @param {Function|null} opts.onRangesReady   - Callback(newRanges, isLast)
+ * @returns {Promise<Array>} All newly computed ranges
  */
-async function computeCursorRanges(batchSize) {
-  mainLogger.info('Computing range boundaries dynamically using MySQL stream...');
+async function computeCursorRanges(batchSize, {
+  resumeFromUcid = null,
+  startIndex     = 0,
+  saveInterval   = 200,
+  onRangesReady  = null,
+} = {}) {
+  const resumeMsg = resumeFromUcid
+    ? `Resuming stream after UCID: ${resumeFromUcid} (index offset: ${startIndex})`
+    : 'Fresh stream from the beginning';
+  mainLogger.info(`Computing range boundaries via MySQL stream — ${resumeMsg}`);
+
   const pool = getPool();
   const conn = await pool.getConnection();
 
   return new Promise((resolve, reject) => {
-    const ranges = [];
-    let currentFromUcid = 'initial';
-    let count = 0;
-    let totalCount = 0;
-    let lastSeenUcid = null;
+    const allNewRanges   = [];   // every range computed in this call
+    let   pendingBatch   = [];   // buffer flushed every saveInterval ranges
+    let   currentFromUcid = resumeFromUcid || 'initial';
+    let   count           = 0;
+    let   totalCount      = 0;
+    let   lastSeenUcid    = null;
 
-    const limitVal = process.env.MIGRATION_LIMIT ? parseInt(process.env.MIGRATION_LIMIT) : 0;
+    const limitVal    = process.env.MIGRATION_LIMIT ? parseInt(process.env.MIGRATION_LIMIT) : 0;
     const limitClause = limitVal > 0 ? ` LIMIT ${limitVal}` : '';
 
+    // Build the WHERE clause for resume support
+    const escapedResume = resumeFromUcid
+      ? conn.connection.escape(resumeFromUcid)
+      : null;
+    const whereClause = escapedResume ? ` WHERE matter_ucid > ${escapedResume}` : '';
+
     const stream = conn.connection
-      .query(`SELECT matter_ucid FROM public_matter ORDER BY matter_ucid ASC${limitClause}`)
+      .query(`SELECT matter_ucid FROM public_matter${whereClause} ORDER BY matter_ucid ASC${limitClause}`)
       .stream();
 
     stream.on('data', (row) => {
@@ -268,34 +297,59 @@ async function computeCursorRanges(batchSize) {
       lastSeenUcid = row.matter_ucid;
 
       if (count === batchSize) {
-        ranges.push({
-          index:    ranges.length,
+        const newRange = {
+          index:    startIndex + allNewRanges.length,
           fromUcid: currentFromUcid,
           toUcid:   row.matter_ucid,
           count:    batchSize,
-        });
+        };
+        allNewRanges.push(newRange);
+        pendingBatch.push(newRange);
         currentFromUcid = row.matter_ucid;
         count = 0;
+
+        // Flush buffer to caller every saveInterval ranges
+        if (onRangesReady && pendingBatch.length >= saveInterval) {
+          onRangesReady(pendingBatch.splice(0), false);
+        }
       }
 
       if (totalCount % 100000 === 0) {
-        mainLogger.info(`Streamed ${totalCount.toLocaleString()} UCIDs... (ranges: ${ranges.length})`);
+        mainLogger.info(
+          `Streamed ${totalCount.toLocaleString()} UCIDs... ` +
+          `(new ranges: ${allNewRanges.length}, total: ${startIndex + allNewRanges.length})`
+        );
       }
     });
 
     stream.on('end', () => {
+      // Handle any tail records that didn't fill a full batch
       if (count > 0 && lastSeenUcid) {
-        ranges.push({
-          index:    ranges.length,
+        const tailRange = {
+          index:    startIndex + allNewRanges.length,
           fromUcid: currentFromUcid,
           toUcid:   lastSeenUcid,
-          count:    count,
-        });
+          count,
+        };
+        allNewRanges.push(tailRange);
+        pendingBatch.push(tailRange);
       }
-      mainLogger.info(`Total documents in source DB: ${totalCount.toLocaleString()}`);
-      mainLogger.info(`Computed ${ranges.length} ranges of ~${batchSize} docs each.`);
+
+      // Final flush (isLast = true)
+      if (onRangesReady && pendingBatch.length > 0) {
+        onRangesReady(pendingBatch.splice(0), true);
+      } else if (onRangesReady) {
+        // Stream ended with an empty tail — still signal completion
+        onRangesReady([], true);
+      }
+
+      mainLogger.info(`Total UCIDs scanned this run : ${totalCount.toLocaleString()}`);
+      mainLogger.info(
+        `New ranges computed : ${allNewRanges.length} ` +
+        `(total incl. prior runs: ${startIndex + allNewRanges.length})`
+      );
       conn.release();
-      resolve(ranges);
+      resolve(allNewRanges);
     });
 
     stream.on('error', (err) => {
