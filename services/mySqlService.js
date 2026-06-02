@@ -237,24 +237,23 @@ async function hydrateMatterRows(rows) {
 // ─── RANGE PRE-COMPUTATION ───────────────────────────────────────────────────
 
 /**
- * Streams matter_ucid to build range boundary objects incrementally.
+ * Computes range boundaries using paginated cursor queries.
  *
- * Supports resuming from a previous crash:
- *   - resumeFromUcid: skip rows already processed (WHERE matter_ucid > ?)
- *   - startIndex:     offset range indices so they don't clash with cached ones
+ * WHY NOT STREAM: mysql2's .stream() has no TCP backpressure against MySQL,
+ * so the server sends all 333M rows into Node's heap at once → OOM crash.
+ * Paginated queries fetch SCAN_PAGE rows at a time and discard them after
+ * slicing into ranges, keeping memory bounded to ~2 MB per iteration.
  *
- * Calls onRangesReady(newRanges, isLast) every saveInterval completed ranges
- * (and once more with the final tail batch when the stream ends).  The caller
- * can use this to persist ranges and dispatch migration workers immediately —
- * without waiting for all 333 M rows to be scanned first.
+ * Calls onRangesReady(newRanges, isLast) every saveInterval ranges so the
+ * caller can save to disk and dispatch workers immediately — no waiting for
+ * all UCIDs to be scanned.
  *
- * @param {number} batchSize
+ * @param {number} batchSize         - Docs per migration range (BATCH_SIZE env)
  * @param {object} opts
- * @param {string|null}   opts.resumeFromUcid  - Resume stream after this UCID
- * @param {number}        opts.startIndex       - Index offset for new ranges
- * @param {number}        opts.saveInterval     - Flush every N ranges (default 200)
- * @param {Function|null} opts.onRangesReady   - Callback(newRanges, isLast)
- * @returns {Promise<Array>} All newly computed ranges
+ * @param {string|null}   opts.resumeFromUcid - Resume after this UCID
+ * @param {number}        opts.startIndex      - Range index offset for resumed runs
+ * @param {number}        opts.saveInterval    - Flush every N ranges (default 200)
+ * @param {Function|null} opts.onRangesReady  - Callback(newRanges, isLast)
  */
 async function computeCursorRanges(batchSize, {
   resumeFromUcid = null,
@@ -262,53 +261,63 @@ async function computeCursorRanges(batchSize, {
   saveInterval   = 200,
   onRangesReady  = null,
 } = {}) {
-  const resumeMsg = resumeFromUcid
-    ? `Resuming stream after UCID: ${resumeFromUcid} (index offset: ${startIndex})`
-    : 'Fresh stream from the beginning';
-  mainLogger.info(`Computing range boundaries via MySQL stream — ${resumeMsg}`);
+  // Each page: 100K rows × ~20 bytes ≈ 2 MB — safe on any instance size.
+  const SCAN_PAGE = Math.max(batchSize, 100000);
 
   const pool = getPool();
-  const conn = await pool.getConnection();
 
-  return new Promise((resolve, reject) => {
-    const allNewRanges   = [];   // every range computed in this call
-    let   pendingBatch   = [];   // buffer flushed every saveInterval ranges
-    let   currentFromUcid = resumeFromUcid || 'initial';
-    let   count           = 0;
-    let   totalCount      = 0;
-    let   lastSeenUcid    = null;
+  mainLogger.info(
+    `Computing range boundaries via paginated queries` +
+    ` (page=${SCAN_PAGE.toLocaleString()}, batchSize=${batchSize.toLocaleString()})` +
+    (resumeFromUcid ? ` — resuming after ${resumeFromUcid}` : ' — fresh start')
+  );
 
-    const limitVal    = process.env.MIGRATION_LIMIT ? parseInt(process.env.MIGRATION_LIMIT) : 0;
-    const limitClause = limitVal > 0 ? ` LIMIT ${limitVal}` : '';
+  const allNewRanges = [];
+  let   pendingBatch = [];
+  let   cursor       = resumeFromUcid || 'initial'; // upper bound of previous page
+  let   fromUcid     = cursor;                       // lower bound of current range
+  let   withinPage   = 0;                            // rows counted into current range
+  let   totalCount   = 0;
 
-    // Build the WHERE clause for resume support
-    const escapedResume = resumeFromUcid
-      ? conn.connection.escape(resumeFromUcid)
-      : null;
-    const whereClause = escapedResume ? ` WHERE matter_ucid > ${escapedResume}` : '';
+  const limitVal = process.env.MIGRATION_LIMIT ? parseInt(process.env.MIGRATION_LIMIT) : 0;
 
-    const stream = conn.connection
-      .query(`SELECT matter_ucid FROM public_matter${whereClause} ORDER BY matter_ucid ASC${limitClause}`)
-      .stream();
+  while (true) {
+    const isInitial = cursor === 'initial';
 
-    stream.on('data', (row) => {
+    // How many rows to fetch this page (respect MIGRATION_LIMIT if set)
+    let pageSize = SCAN_PAGE;
+    if (limitVal > 0) {
+      const remaining = limitVal - totalCount;
+      if (remaining <= 0) break;
+      pageSize = Math.min(SCAN_PAGE, remaining);
+    }
+
+    const [rows] = await pool.query(
+      isInitial
+        ? `SELECT matter_ucid FROM public_matter ORDER BY matter_ucid ASC LIMIT ?`
+        : `SELECT matter_ucid FROM public_matter WHERE matter_ucid > ? ORDER BY matter_ucid ASC LIMIT ?`,
+      isInitial ? [pageSize] : [cursor, pageSize]
+    );
+
+    if (!rows.length) break;
+
+    // Slice this page into batchSize ranges
+    for (const row of rows) {
       totalCount++;
-      count++;
-      lastSeenUcid = row.matter_ucid;
+      withinPage++;
 
-      if (count === batchSize) {
-        const newRange = {
+      if (withinPage === batchSize) {
+        const range = {
           index:    startIndex + allNewRanges.length,
-          fromUcid: currentFromUcid,
+          fromUcid: fromUcid,
           toUcid:   row.matter_ucid,
           count:    batchSize,
         };
-        allNewRanges.push(newRange);
-        pendingBatch.push(newRange);
-        currentFromUcid = row.matter_ucid;
-        count = 0;
+        allNewRanges.push(range);
+        pendingBatch.push(range);
+        fromUcid   = row.matter_ucid;
+        withinPage = 0;
 
-        // Flush buffer to caller every saveInterval ranges
         if (onRangesReady && pendingBatch.length >= saveInterval) {
           onRangesReady(pendingBatch.splice(0), false);
         }
@@ -316,49 +325,40 @@ async function computeCursorRanges(batchSize, {
 
       if (totalCount % 100000 === 0) {
         mainLogger.info(
-          `Streamed ${totalCount.toLocaleString()} UCIDs... ` +
-          `(new ranges: ${allNewRanges.length}, total: ${startIndex + allNewRanges.length})`
+          `Scanned ${totalCount.toLocaleString()} UCIDs... ` +
+          `(ranges: ${startIndex + allNewRanges.length})`
         );
       }
-    });
+    }
 
-    stream.on('end', () => {
-      // Handle any tail records that didn't fill a full batch
-      if (count > 0 && lastSeenUcid) {
-        const tailRange = {
-          index:    startIndex + allNewRanges.length,
-          fromUcid: currentFromUcid,
-          toUcid:   lastSeenUcid,
-          count,
-        };
-        allNewRanges.push(tailRange);
-        pendingBatch.push(tailRange);
-      }
+    cursor = rows[rows.length - 1].matter_ucid;
+    if (rows.length < pageSize) break; // final page — done
+  }
 
-      // Final flush (isLast = true)
-      if (onRangesReady && pendingBatch.length > 0) {
-        onRangesReady(pendingBatch.splice(0), true);
-      } else if (onRangesReady) {
-        // Stream ended with an empty tail — still signal completion
-        onRangesReady([], true);
-      }
+  // Tail: remaining UCIDs that didn't fill a full batch
+  if (withinPage > 0) {
+    const tailRange = {
+      index:    startIndex + allNewRanges.length,
+      fromUcid: fromUcid,
+      toUcid:   cursor,
+      count:    withinPage,
+    };
+    allNewRanges.push(tailRange);
+    pendingBatch.push(tailRange);
+  }
 
-      mainLogger.info(`Total UCIDs scanned this run : ${totalCount.toLocaleString()}`);
-      mainLogger.info(
-        `New ranges computed : ${allNewRanges.length} ` +
-        `(total incl. prior runs: ${startIndex + allNewRanges.length})`
-      );
-      conn.release();
-      resolve(allNewRanges);
-    });
+  // Final flush — always signal isLast=true so manager marks streamingComplete
+  if (onRangesReady) {
+    onRangesReady(pendingBatch.splice(0), true);
+  }
 
-    stream.on('error', (err) => {
-      mainLogger.error(`Stream error while computing ranges: ${err.message}`);
-      conn.release();
-      reject(err);
-    });
-  });
+  mainLogger.info(
+    `Range computation complete: ${allNewRanges.length} new ranges, ` +
+    `${totalCount.toLocaleString()} UCIDs scanned`
+  );
+  return allNewRanges;
 }
+
 
 // ─── RANGE FETCHER ────────────────────────────────────────────────────────────
 
