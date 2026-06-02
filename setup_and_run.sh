@@ -151,7 +151,7 @@ mkdir -p "$LOG_DIR"
 # Launch in background
 echo ""
 echo "🚀 Starting migration in background..."
-nohup node --max-old-space-size=4096 "$SCRIPT_DIR/app.js" >> "$RUN_LOG" 2>&1 &
+nohup node --max-old-space-size=6144 "$SCRIPT_DIR/app.js" >> "$RUN_LOG" 2>&1 &
 MIGRATION_PID=$!
 echo "$MIGRATION_PID" > "$PID_FILE"
 
