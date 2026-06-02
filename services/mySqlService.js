@@ -385,6 +385,16 @@ async function initializeMigrationTable() {
     `);
     mainLogger.info('MySQL migration_prod_logs table initialized.');
   } catch (err) {
+    if (err.code === 'ER_TABLEACCESS_DENIED_ERROR' || err.message.includes('CREATE command denied')) {
+      try {
+        await pool.query('SELECT 1 FROM migration_prod_logs LIMIT 1');
+        mainLogger.warn('Lacked CREATE privileges, but migration_prod_logs table already exists. Continuing.');
+        return;
+      } catch (selectErr) {
+        mainLogger.error(`Table migration_prod_logs does not exist or is inaccessible: ${selectErr.message}`);
+        throw selectErr;
+      }
+    }
     mainLogger.error(`Error initializing migration_prod_logs table: ${err.message}`);
     throw err;
   }
