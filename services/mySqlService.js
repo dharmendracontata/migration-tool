@@ -96,61 +96,82 @@ async function closePool() {
 
 // ─── CHILD DATA FETCHERS (shared by fetchRange + fetchByUcids) ───────────────
 
+/** Tags a thrown error with the query source so logs clearly show which DB call failed. */
+function tagError(source, err) {
+  err.querySource = source;
+  err.message     = `[${source}] ${err.message}`;
+  throw err;
+}
+
 async function fetchParties(matterUcids) {
   if (!matterUcids.length) return {};
-  const [rows] = await getPool().query(
-    `SELECT l.matter_ucid, p.party_type, p.party_std_name, p.party_country, p.party_address
-     FROM public_matter_party_link l
-     JOIN matter_party p ON l.matter_party_id = p.matter_party_id
-     WHERE l.matter_ucid IN (?) ORDER BY l.matter_ucid, l.sequence`, [matterUcids]);
-  return groupByUcid(rows);
+  try {
+    const [rows] = await getPool().query(
+      `SELECT l.matter_ucid, p.party_type, p.party_std_name, p.party_country, p.party_address
+       FROM public_matter_party_link l
+       JOIN matter_party p ON l.matter_party_id = p.matter_party_id
+       WHERE l.matter_ucid IN (?) ORDER BY l.matter_ucid, l.sequence`, [matterUcids]);
+    return groupByUcid(rows);
+  } catch (err) { tagError('MySQL:fetchParties', err); }
 }
 async function fetchDocuments(matterUcids) {
   if (!matterUcids.length) return {};
-  const [rows] = await getPool().query(
-    `SELECT m.application_reference_ucid as matter_ucid, m.publication_ucid, c.document_type
-     FROM ifi_publication_application_map m
-     LEFT JOIN country_kind_code_description c ON
-       c.country_code = SUBSTRING_INDEX(m.publication_ucid, '-', 1) AND
-       c.kind_code = SUBSTRING_INDEX(m.publication_ucid, '-', -1)
-     WHERE m.application_reference_ucid IN (?)`, [matterUcids]);
-  return groupByUcid(rows);
+  try {
+    const [rows] = await getPool().query(
+      `SELECT m.application_reference_ucid as matter_ucid, m.publication_ucid, c.document_type
+       FROM ifi_publication_application_map m
+       LEFT JOIN country_kind_code_description c ON
+         c.country_code = SUBSTRING_INDEX(m.publication_ucid, '-', 1) AND
+         c.kind_code = SUBSTRING_INDEX(m.publication_ucid, '-', -1)
+       WHERE m.application_reference_ucid IN (?)`, [matterUcids]);
+    return groupByUcid(rows);
+  } catch (err) { tagError('MySQL:fetchDocuments', err); }
 }
 async function fetchCitations(matterUcids) {
   if (!matterUcids.length) return {};
-  const [rows] = await getPool().query(
-    `SELECT cited_by_matter_ucid as matter_ucid, cited_publication_ucid, source_name
-     FROM public_matter_citation_link WHERE cited_by_matter_ucid IN (?)`, [matterUcids]);
-  return groupByUcid(rows);
+  try {
+    const [rows] = await getPool().query(
+      `SELECT cited_by_matter_ucid as matter_ucid, cited_publication_ucid, source_name
+       FROM public_matter_citation_link WHERE cited_by_matter_ucid IN (?)`, [matterUcids]);
+    return groupByUcid(rows);
+  } catch (err) { tagError('MySQL:fetchCitations', err); }
 }
 async function fetchPriorityClaims(matterUcids) {
   if (!matterUcids.length) return {};
-  const [rows] = await getPool().query(
-    `SELECT claimed_by_matter_ucid as matter_ucid, claimed_matter_ucid, claimed_matter_filing_date
-     FROM public_matter_priority_claim_link WHERE claimed_by_matter_ucid IN (?)`, [matterUcids]);
-  return groupByUcid(rows);
+  try {
+    const [rows] = await getPool().query(
+      `SELECT claimed_by_matter_ucid as matter_ucid, claimed_matter_ucid, claimed_matter_filing_date
+       FROM public_matter_priority_claim_link WHERE claimed_by_matter_ucid IN (?)`, [matterUcids]);
+    return groupByUcid(rows);
+  } catch (err) { tagError('MySQL:fetchPriorityClaims', err); }
 }
 async function fetchClassifications(matterUcids) {
   if (!matterUcids.length) return {};
-  const [rows] = await getPool().query(
-    `SELECT matter_ucid, classification_code_type, classification_code
-     FROM public_matter_classification WHERE matter_ucid IN (?)`, [matterUcids]);
-  return groupByUcid(rows);
+  try {
+    const [rows] = await getPool().query(
+      `SELECT matter_ucid, classification_code_type, classification_code
+       FROM public_matter_classification WHERE matter_ucid IN (?)`, [matterUcids]);
+    return groupByUcid(rows);
+  } catch (err) { tagError('MySQL:fetchClassifications', err); }
 }
 async function fetchEpCountries(matterUcids) {
   if (!matterUcids.length) return {};
-  const [rows] = await getPool().query(
-    `SELECT matter_ucid, designated_country, status, status_type,
-            status_date, fee_payment_date, designated_country_matter_ucid
-     FROM public_matter_ep_designated_country WHERE matter_ucid IN (?)`, [matterUcids]);
-  return groupByUcid(rows);
+  try {
+    const [rows] = await getPool().query(
+      `SELECT matter_ucid, designated_country, status, status_type,
+              status_date, fee_payment_date, designated_country_matter_ucid
+       FROM public_matter_ep_designated_country WHERE matter_ucid IN (?)`, [matterUcids]);
+    return groupByUcid(rows);
+  } catch (err) { tagError('MySQL:fetchEpCountries', err); }
 }
 async function fetchLegalStatusEvents(matterUcids) {
   if (!matterUcids.length) return {};
-  const [rows] = await getPool().query(
-    `SELECT matter_ucid, code, country, date_of_public_notification
-     FROM public_matter_legal_status_event WHERE matter_ucid IN (?)`, [matterUcids]);
-  return groupByUcid(rows);
+  try {
+    const [rows] = await getPool().query(
+      `SELECT matter_ucid, code, country, date_of_public_notification
+       FROM public_matter_legal_status_event WHERE matter_ucid IN (?)`, [matterUcids]);
+    return groupByUcid(rows);
+  } catch (err) { tagError('MySQL:fetchLegalStatusEvents', err); }
 }
 
 function groupByUcid(rows) {
@@ -165,77 +186,90 @@ function groupByUcid(rows) {
 async function fetchFamilyMembers(familyIds) {
   const filtered = familyIds.filter(Boolean);
   if (!filtered.length) return {};
-  const [rows] = await getPool().query(
-    'SELECT matter_ucid, family_id FROM public_matter WHERE family_id IN (?)',
-    [filtered]
-  );
-  const map = {};
-  for (const row of rows) {
-    if (!map[row.family_id]) map[row.family_id] = [];
-    map[row.family_id].push(row.matter_ucid);
-  }
-  return map;
+  try {
+    const [rows] = await getPool().query(
+      'SELECT matter_ucid, family_id FROM public_matter WHERE family_id IN (?)',
+      [filtered]
+    );
+    const map = {};
+    for (const row of rows) {
+      if (!map[row.family_id]) map[row.family_id] = [];
+      map[row.family_id].push(row.matter_ucid);
+    }
+    return map;
+  } catch (err) { tagError('MySQL:fetchFamilyMembers', err); }
 }
 
 async function fetchForwardCitationsCounts(patentUcids) {
   const filtered = patentUcids.filter(Boolean);
   if (!filtered.length) return {};
-  const [rows] = await getPool().query(
-    `SELECT cited_publication_ucid,
-            COUNT(DISTINCT cited_by_matter_ucid) AS count,
-            COUNT(DISTINCT CASE WHEN source_name = 'EXA' THEN cited_by_matter_ucid END) AS count_exa
-     FROM public_matter_citation_link
-     WHERE cited_publication_ucid IN (?)
-     GROUP BY cited_publication_ucid`,
-    [filtered]
-  );
-  const map = {};
-  for (const row of rows) {
-    map[row.cited_publication_ucid] = {
-      count: row.count,
-      countExa: row.count_exa
-    };
-  }
-  return map;
+  try {
+    const [rows] = await getPool().query(
+      `SELECT cited_publication_ucid,
+              COUNT(DISTINCT cited_by_matter_ucid) AS count,
+              COUNT(DISTINCT CASE WHEN source_name = 'EXA' THEN cited_by_matter_ucid END) AS count_exa
+       FROM public_matter_citation_link
+       WHERE cited_publication_ucid IN (?)
+       GROUP BY cited_publication_ucid`,
+      [filtered]
+    );
+    const map = {};
+    for (const row of rows) {
+      map[row.cited_publication_ucid] = { count: row.count, countExa: row.count_exa };
+    }
+    return map;
+  } catch (err) { tagError('MySQL:fetchForwardCitations', err); }
 }
 
 /**
  * Shared hydration: joins child data onto matter rows and maps to OpenSearch docs.
+ *
+ * Uses two parallel waves to cap peak MySQL connections:
+ *   Wave 1 — 7 fast simple lookups  (fired together)
+ *   Wave 2 — 2 expensive aggregations (fired after wave 1 finishes)
+ * Peak connections per worker: max(7, 2) instead of 9.
+ * With 16 workers: 16×7=112 peak (wave 1) → 16×2=32 (wave 2).
  */
 async function hydrateMatterRows(rows) {
   if (!rows.length) return [];
-  const matterUcids    = rows.map(r => r.matter_ucid);
-  const patentUcids    = [...new Set(rows.map(r => r.patent_ucid).filter(Boolean))];
-  const familyIds      = [...new Set(rows.map(r => r.family_id).filter(Boolean))];
+  const matterUcids = rows.map(r => r.matter_ucid);
+  const patentUcids = [...new Set(rows.map(r => r.patent_ucid).filter(Boolean))];
+  const familyIds   = [...new Set(rows.map(r => r.family_id).filter(Boolean))];
 
-  const [parties, docs, citations, priorities, classifications, epCountries, legalEvents, familyMembersMap, forwardCitationsMap] = await Promise.all([
-    fetchParties(matterUcids),
-    fetchDocuments(matterUcids),
-    fetchCitations(matterUcids),
-    fetchPriorityClaims(matterUcids),
-    fetchClassifications(matterUcids),
-    fetchEpCountries(matterUcids),
-    fetchLegalStatusEvents(matterUcids),
-    familyIds.length ? fetchFamilyMembers(familyIds) : Promise.resolve({}),
-    patentUcids.length ? fetchForwardCitationsCounts(patentUcids) : Promise.resolve({})
+  // ── Wave 1: fast indexed lookups ──────────────────────────────────────────
+  const [parties, docs, citations, priorities, classifications, epCountries, legalEvents] =
+    await Promise.all([
+      fetchParties(matterUcids),
+      fetchDocuments(matterUcids),
+      fetchCitations(matterUcids),
+      fetchPriorityClaims(matterUcids),
+      fetchClassifications(matterUcids),
+      fetchEpCountries(matterUcids),
+      fetchLegalStatusEvents(matterUcids),
+    ]);
+
+  // ── Wave 2: expensive aggregations (run after wave 1 frees connections) ───
+  const [familyMembersMap, forwardCitationsMap] = await Promise.all([
+    familyIds.length   ? fetchFamilyMembers(familyIds)              : Promise.resolve({}),
+    patentUcids.length ? fetchForwardCitationsCounts(patentUcids)   : Promise.resolve({}),
   ]);
 
   return rows.map(row => {
-    const familyList = (familyMembersMap[row.family_id] || []).filter(u => u !== row.matter_ucid);
+    const familyList          = (familyMembersMap[row.family_id] || []).filter(u => u !== row.matter_ucid);
     const forwardCitationInfo = forwardCitationsMap[row.patent_ucid] || { count: 0, countExa: 0 };
     return {
       id:     row.matter_ucid,
       fields: mapSqlRowToOpenSearch({
         ...row,
-        _parties:           parties[row.matter_ucid]         || [],
-        _documents:         docs[row.matter_ucid]            || [],
-        _citations:         citations[row.matter_ucid]       || [],
-        _priorities:        priorities[row.matter_ucid]      || [],
-        _classifications:   classifications[row.matter_ucid] || [],
-        _familyMatters:     familyList,
-        _epCountries:       epCountries[row.matter_ucid]     || [],
-        _legalStatusEvents: legalEvents[row.matter_ucid]     || [],
-        _forwardCitationInfo: forwardCitationInfo
+        _parties:             parties[row.matter_ucid]         || [],
+        _documents:           docs[row.matter_ucid]            || [],
+        _citations:           citations[row.matter_ucid]       || [],
+        _priorities:          priorities[row.matter_ucid]      || [],
+        _classifications:     classifications[row.matter_ucid] || [],
+        _familyMatters:       familyList,
+        _epCountries:         epCountries[row.matter_ucid]     || [],
+        _legalStatusEvents:   legalEvents[row.matter_ucid]     || [],
+        _forwardCitationInfo: forwardCitationInfo,
       }),
     };
   });
