@@ -34,12 +34,19 @@ function getPool() {
       database:           process.env.MYSQL_DATABASE || 'matters_db',
       charset:            'utf8',
       waitForConnections: true,
-      // Each range fetch fires 7 parallel sub-queries; size pool accordingly.
-      connectionLimit:    Math.max(30, PARALLEL_WORKERS * 8),
+
+      // ── Pool sizing ────────────────────────────────────────────────────────
+      // Cap at PARALLEL_WORKERS * 6 (not *8) to avoid flooding RDS
+      // max_connections when many workers fire 9 child queries in parallel.
+      connectionLimit:    Math.max(20, PARALLEL_WORKERS * 6),
       queueLimit:         500,
-      maxIdle:            Math.max(10, PARALLEL_WORKERS * 2),
-      idleTimeout:        60000,
-      connectTimeout:     15000,
+      maxIdle:            Math.max(5, PARALLEL_WORKERS),
+      idleTimeout:        120000,  // 2 min — keep idle conns alive longer
+
+      // ── Stability for same-region high-concurrency connections ─────────────
+      connectTimeout:        30000,  // 30s (was 15s) — more headroom under load
+      enableKeepAlive:       true,   // prevent MySQL silently closing idle conns
+      keepAliveInitialDelay: 30000,  // start keepalive after 30s idle
     });
     mainLogger.info(`MySQL source pool created → ${process.env.MYSQL_HOST}:${process.env.MYSQL_PORT || 3306}`);
   }
