@@ -36,9 +36,9 @@ function getPool() {
       waitForConnections: true,
 
       // ── Pool sizing ────────────────────────────────────────────────────────
-      // Cap at PARALLEL_WORKERS * 6 (not *8) to avoid flooding RDS
-      // max_connections when many workers fire 9 child queries in parallel.
-      connectionLimit:    Math.max(20, PARALLEL_WORKERS * 6),
+      // Each worker fires 7 queries in wave 1 — pool must fit PARALLEL_WORKERS*7.
+      // Use *8 to give a small buffer above the wave-1 peak.
+      connectionLimit:    Math.max(20, PARALLEL_WORKERS * 8),
       queueLimit:         500,
       maxIdle:            Math.max(5, PARALLEL_WORKERS),
       idleTimeout:        120000,  // 2 min — keep idle conns alive longer
