@@ -63,8 +63,15 @@ async function startMigration() {
   let   totalSaved       = saved.totalSaved       || 0;
   let   totalFailed      = saved.totalFailed      || 0;
   let   allRanges        = saved.rangeBoundaries  || [];   // grows as streaming progresses
-  const streamingComplete = saved.streamingComplete === true;
+  let   streamingComplete = saved.streamingComplete === true;
   let   _streamingComplete = false;
+
+  // Recovery safeguard: if streaming was marked complete but ranges are missing/empty,
+  // we must force streamingComplete to false so the tool re-scans the DB and restores them.
+  if (streamingComplete && allRanges.length === 0) {
+    mainLogger.warn("Recovery: range boundaries are missing from disk. Forcing re-computation of ranges...");
+    streamingComplete = false;
+  }
 
   // ── Helper: persist current state ─────────────────────────────────────────
   // Called from both the streaming callback and worker completions.
