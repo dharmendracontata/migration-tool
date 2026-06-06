@@ -29,7 +29,6 @@ async function startMigration() {
   let   totalFailed      = saved.totalFailed      || 0;
   let   allRanges        = saved.rangeBoundaries  || [];   // grows as streaming progresses
   const streamingComplete = saved.streamingComplete === true;
-  let   _streamingComplete = false;
 
   // ── Helper: persist current state ─────────────────────────────────────────
   // Called from both the streaming callback and worker completions.
@@ -42,27 +41,16 @@ async function startMigration() {
       totalFailed,
       streamingComplete: opts.streamingComplete ?? streamingComplete,
       rangeBoundaries:   allRanges,
-    }, opts.writeRanges ?? false);
+    });
   }
 
   // ── Helper: dispatch one range to a p-limited worker ──────────────────────
-  let activeWorkers = 0;
-  let resolveMigration;
-  const migrationCompletionPromise = new Promise(resolve => {
-    resolveMigration = resolve;
-  });
+  const workerPromises = [];
 
   function dispatchRange(range) {
-    activeWorkers++;
-    limit(async () => {
+    const p = limit(async () => {
       const rangeLabel = `Range #${range.index} [${range.fromUcid} → ${range.toUcid}]`;
       try {
-        // Apply backpressure if log buffer is too full
-        while (logBuffer.pendingCount() > 50000) {
-          mainLogger.warn(`Log buffer size (${logBuffer.pendingCount()}) exceeds limit. Pausing range fetch to let log writer catch up...`);
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        }
-
         mainLogger.info(`${rangeLabel}: fetching...`);
         const docs = await retry(() => fetchRange(range.fromUcid, range.toUcid));
 
@@ -89,13 +77,9 @@ async function startMigration() {
           tags:  { process: "migrationManager.js", phase: "range-processing", rangeIndex: range.index },
           extra: { rangeLabel, range },
         });
-      } finally {
-        activeWorkers--;
-        if (activeWorkers === 0 && (streamingComplete || _streamingComplete)) {
-          resolveMigration();
-        }
       }
     });
+    workerPromises.push(p);
   }
 
   // ── Phase 1: Streaming (with incremental save + immediate dispatch) ────────
@@ -106,16 +90,11 @@ async function startMigration() {
       `${allRanges.length} ranges restored, ${completedSet.size} already done.`
     );
     const pending = allRanges.filter(r => !completedSet.has(r.index));
-    if (pending.length === 0) {
-      mainLogger.info("All ranges already completed. Nothing to migrate.");
-      resolveMigration();
-    } else {
-      mainLogger.info(
-        `Starting parallel migration: ${pending.length} pending | ` +
-        `${completedSet.size} done | ${PARALLEL_WORKERS} workers`
-      );
-      pending.forEach(dispatchRange);
-    }
+    mainLogger.info(
+      `Starting parallel migration: ${pending.length} pending | ` +
+      `${completedSet.size} done | ${PARALLEL_WORKERS} workers`
+    );
+    pending.forEach(dispatchRange);
 
   } else {
     // ── Resumable streaming path ──────────────────────────────────────────
@@ -140,6 +119,9 @@ async function startMigration() {
       mainLogger.info(`Dispatching ${alreadyCached.length} cached-but-pending ranges immediately...`);
       alreadyCached.forEach(dispatchRange);
     }
+
+    // Track whether onRangesReady has marked streaming complete
+    let _streamingComplete = false;
 
     // Stream and receive new ranges in chunks
     await computeCursorRanges(
@@ -173,7 +155,7 @@ async function startMigration() {
             totalFailed,
             streamingComplete: _streamingComplete,
             rangeBoundaries:   allRanges,
-          }, true);
+          });
 
           // Dispatch new ranges to workers immediately — no waiting!
           newRanges
@@ -185,12 +167,8 @@ async function startMigration() {
   }
 
   // ── Phase 2: Wait for all dispatched workers to finish ────────────────────
-  if (activeWorkers > 0) {
-    mainLogger.info(`Waiting for ${activeWorkers} active workers to complete...`);
-    await migrationCompletionPromise;
-  } else {
-    mainLogger.info("No active workers to wait for.");
-  }
+  mainLogger.info(`Waiting for ${workerPromises.length} workers to complete...`);
+  await Promise.all(workerPromises);
 
   // ── Final flush & summary ──────────────────────────────────────────────────
   if (process.env.NODE_ENV === "prod") {
