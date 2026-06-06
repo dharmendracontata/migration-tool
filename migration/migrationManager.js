@@ -1,3 +1,5 @@
+const pLimit = require("p-limit");
+
 const { computeCursorRanges, fetchRange, initializeMigrationTable } = require("../services/mySqlService");
 const { initializeIndex } = require("../services/openSearchService");
 const processBatch = require("./migrationWorker");
@@ -10,44 +12,7 @@ const { captureException, captureMessage, addBreadcrumb } = require("../utils/se
 
 const PARALLEL_WORKERS  = parseInt(process.env.PARALLEL_WORKERS) || 5;
 const RANGE_SAVE_INTERVAL = parseInt(process.env.RANGE_SAVE_INTERVAL) || 200; // flush every N ranges
-
-// ─── BOUNDED ASYNC QUEUE ─────────────────────────────────────────────────────
-class AsyncQueue {
-  constructor() {
-    this.queue = [];
-    this.waitingResolvers = [];
-    this.closed = false;
-  }
-
-  push(item) {
-    if (this.waitingResolvers.length > 0) {
-      const resolve = this.waitingResolvers.shift();
-      resolve(item);
-    } else {
-      this.queue.push(item);
-    }
-  }
-
-  close() {
-    this.closed = true;
-    while (this.waitingResolvers.length > 0) {
-      const resolve = this.waitingResolvers.shift();
-      resolve(null);
-    }
-  }
-
-  async next() {
-    if (this.queue.length > 0) {
-      return this.queue.shift();
-    }
-    if (this.closed) {
-      return null;
-    }
-    return new Promise(resolve => {
-      this.waitingResolvers.push(resolve);
-    });
-  }
-}
+const limit = pLimit(PARALLEL_WORKERS);
 
 async function startMigration() {
   // ── Setup ──────────────────────────────────────────────────────────────────
@@ -68,6 +33,7 @@ async function startMigration() {
 
   // ── Helper: persist current state ─────────────────────────────────────────
   // Called from both the streaming callback and worker completions.
+  // Node.js is single-threaded so there are no real races; we write atomically.
   function persist(opts = {}) {
     saveProgress({
       completedRanges:   Array.from(completedSet),
@@ -79,61 +45,60 @@ async function startMigration() {
     }, opts.writeRanges ?? false);
   }
 
-  // ── Helper: process one range ──────────────────────────────────────────────
-  async function processRange(range) {
-    const rangeLabel = `Range #${range.index} [${range.fromUcid} → ${range.toUcid}]`;
-    try {
-      // Apply backpressure if log buffer is too full
-      while (logBuffer.pendingCount() > 50000) {
-        mainLogger.warn(`Log buffer size (${logBuffer.pendingCount()}) exceeds limit. Pausing range fetch to let log writer catch up...`);
-        await new Promise(resolve => setTimeout(resolve, 2000));
+  // ── Helper: dispatch one range to a p-limited worker ──────────────────────
+  let activeWorkers = 0;
+  let resolveMigration;
+  const migrationCompletionPromise = new Promise(resolve => {
+    resolveMigration = resolve;
+  });
+
+  function dispatchRange(range) {
+    activeWorkers++;
+    limit(async () => {
+      const rangeLabel = `Range #${range.index} [${range.fromUcid} → ${range.toUcid}]`;
+      try {
+        // Apply backpressure if log buffer is too full
+        while (logBuffer.pendingCount() > 50000) {
+          mainLogger.warn(`Log buffer size (${logBuffer.pendingCount()}) exceeds limit. Pausing range fetch to let log writer catch up...`);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+
+        mainLogger.info(`${rangeLabel}: fetching...`);
+        const docs = await retry(() => fetchRange(range.fromUcid, range.toUcid));
+
+        if (!docs || docs.length === 0) {
+          mainLogger.warn(`${rangeLabel}: 0 docs found — marking complete.`);
+        } else {
+          const { succeeded, failed } = await processBatch(docs, range.index);
+          totalSaved  += succeeded;
+          totalFailed += failed;
+          const logMsg =
+            `${rangeLabel}: ✅ ${succeeded}/${docs.length} saved` +
+            (failed > 0 ? ` | ⚠️  ${failed} → DLQ` : "") +
+            ` | Done: ${completedSet.size + 1}/${allRanges.length}`;
+          mainLogger.info(logMsg);
+          addBreadcrumb("migration", logMsg, "info", { rangeIndex: range.index, succeeded, failed });
+        }
+
+        completedSet.add(range.index);
+        persist();
+
+      } catch (err) {
+        mainLogger.error(`${rangeLabel} FAILED — will retry on restart. Error: ${err.message}`);
+        captureException(err, {
+          tags:  { process: "migrationManager.js", phase: "range-processing", rangeIndex: range.index },
+          extra: { rangeLabel, range },
+        });
+      } finally {
+        activeWorkers--;
+        if (activeWorkers === 0 && (streamingComplete || _streamingComplete)) {
+          resolveMigration();
+        }
       }
-
-      mainLogger.info(`${rangeLabel}: fetching...`);
-      const docs = await retry(() => fetchRange(range.fromUcid, range.toUcid));
-
-      if (!docs || docs.length === 0) {
-        mainLogger.warn(`${rangeLabel}: 0 docs found — marking complete.`);
-      } else {
-        const { succeeded, failed } = await processBatch(docs, range.index);
-        totalSaved  += succeeded;
-        totalFailed += failed;
-        const logMsg =
-          `${rangeLabel}: ✅ ${succeeded}/${docs.length} saved` +
-          (failed > 0 ? ` | ⚠️  ${failed} → DLQ` : "") +
-          ` | Done: ${completedSet.size + 1}/${allRanges.length}`;
-        mainLogger.info(logMsg);
-        addBreadcrumb("migration", logMsg, "info", { rangeIndex: range.index, succeeded, failed });
-      }
-
-      completedSet.add(range.index);
-      persist();
-
-    } catch (err) {
-      mainLogger.error(`${rangeLabel} FAILED — will retry on restart. Error: ${err.message}`);
-      captureException(err, {
-        tags:  { process: "migrationManager.js", phase: "range-processing", rangeIndex: range.index },
-        extra: { rangeLabel, range },
-      });
-    }
+    });
   }
 
-  // Initialize blocking async queue for ranges
-  const rangeQueue = new AsyncQueue();
-
-  // Spawn persistent worker loops
-  const workerPromises = [];
-  for (let i = 0; i < PARALLEL_WORKERS; i++) {
-    workerPromises.push((async () => {
-      while (true) {
-        const range = await rangeQueue.next();
-        if (!range) break;
-        await processRange(range);
-      }
-    })());
-  }
-
-  // ── Phase 1: Queueing/Streaming ranges ─────────────────────────────────────
+  // ── Phase 1: Streaming (with incremental save + immediate dispatch) ────────
   if (streamingComplete) {
     // ── Fast path: streaming already finished in a prior run ────────────────
     mainLogger.info(
@@ -143,14 +108,13 @@ async function startMigration() {
     const pending = allRanges.filter(r => !completedSet.has(r.index));
     if (pending.length === 0) {
       mainLogger.info("All ranges already completed. Nothing to migrate.");
-      rangeQueue.close();
+      resolveMigration();
     } else {
       mainLogger.info(
         `Starting parallel migration: ${pending.length} pending | ` +
         `${completedSet.size} done | ${PARALLEL_WORKERS} workers`
       );
-      pending.forEach(r => rangeQueue.push(r));
-      rangeQueue.close();
+      pending.forEach(dispatchRange);
     }
 
   } else {
@@ -169,11 +133,12 @@ async function startMigration() {
       mainLogger.info("Starting fresh range pre-computation (streaming all UCIDs)...");
     }
 
-    // Queue any already-cached ranges that haven't been migrated yet
+    // Dispatch any already-cached ranges that haven't been migrated yet
+    // so migration runs in parallel with the stream from the very first second.
     const alreadyCached = allRanges.filter(r => !completedSet.has(r.index));
     if (alreadyCached.length > 0) {
-      mainLogger.info(`Queueing ${alreadyCached.length} cached-but-pending ranges...`);
-      alreadyCached.forEach(r => rangeQueue.push(r));
+      mainLogger.info(`Dispatching ${alreadyCached.length} cached-but-pending ranges immediately...`);
+      alreadyCached.forEach(dispatchRange);
     }
 
     // Stream and receive new ranges in chunks
@@ -210,22 +175,22 @@ async function startMigration() {
             rangeBoundaries:   allRanges,
           }, true);
 
-          // Queue new ranges to workers immediately
+          // Dispatch new ranges to workers immediately — no waiting!
           newRanges
             .filter(r => !completedSet.has(r.index))
-            .forEach(r => rangeQueue.push(r));
-
-          if (isLast) {
-            rangeQueue.close();
-          }
+            .forEach(dispatchRange);
         },
       }
     );
   }
 
-  // ── Phase 2: Wait for all persistent workers to complete ──────────────────
-  mainLogger.info(`Waiting for persistent worker loops to complete...`);
-  await Promise.all(workerPromises);
+  // ── Phase 2: Wait for all dispatched workers to finish ────────────────────
+  if (activeWorkers > 0) {
+    mainLogger.info(`Waiting for ${activeWorkers} active workers to complete...`);
+    await migrationCompletionPromise;
+  } else {
+    mainLogger.info("No active workers to wait for.");
+  }
 
   // ── Final flush & summary ──────────────────────────────────────────────────
   if (process.env.NODE_ENV === "prod") {
@@ -256,4 +221,3 @@ async function startMigration() {
 }
 
 module.exports = startMigration;
-
