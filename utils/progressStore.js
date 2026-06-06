@@ -27,8 +27,9 @@ function saveProgress(state, writeRanges = false) {
   fs.writeFileSync(PROGRESS_TMP, JSON.stringify(progressState));
   fs.renameSync(PROGRESS_TMP, PROGRESS_FILE);
 
-  // 2. Save range boundaries only if explicitly requested and boundaries are provided
-  if (writeRanges && state.rangeBoundaries) {
+  // 2. Save range boundaries if requested or if migration-ranges.json doesn't exist yet
+  const shouldWriteRanges = writeRanges || !fs.existsSync(RANGES_FILE);
+  if (shouldWriteRanges && state.rangeBoundaries) {
     fs.writeFileSync(RANGES_TMP, JSON.stringify(state.rangeBoundaries));
     fs.renameSync(RANGES_TMP, RANGES_FILE);
   }
