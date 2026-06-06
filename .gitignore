@@ -19,6 +19,8 @@ migration.pid
 # Progress & state snapshots written at runtime
 migration-progress.json
 migration-progress.json.tmp
+migration-ranges.json
+migration-ranges.json.tmp
 migration-dlq.ndjson
 progress.json
 failed-ids.json
